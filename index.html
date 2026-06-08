@@ -59,7 +59,30 @@ const PRIORITY = { High: "#9B2C2C", Med: "#B0731A", Low: "#8A867D" };
 
 let _n = 0;
 const uid = () => Date.now().toString(36) + (_n++).toString(36);
-const card = (ref, title, desc, epic, priority, col) => ({ id: uid(), ref, title, desc, epic, priority, col });
+const card = (ref, title, desc, epic, priority, col) => ({ id: uid(), ref, title, desc, epic, priority, col, photos: [] });
+
+/* shrink a chosen photo so several can fit in the browser's small storage */
+function compressImage(file, maxDim = 1000, quality = 0.7) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        if (w > h && w > maxDim) { h = Math.round(h * maxDim / w); w = maxDim; }
+        else if (h > maxDim) { w = Math.round(w * maxDim / h); h = maxDim; }
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.onerror = reject;
+      img.src = e.target.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 
 const DEFAULT_CARDS = [
   // RESEARCH
@@ -187,6 +210,18 @@ const CSS = `
 .kb-reset:hover{color:#9B2C2C;}
 .kb-loading{text-align:center;color:var(--muted);padding:60px 0;font-size:14px;}
 
+/* ---- photos ---- */
+.kb-photos{display:flex;gap:6px;flex-wrap:wrap;margin-top:11px;}
+.kb-thumb{width:54px;height:54px;border-radius:8px;border:1px solid var(--line);background-size:cover;background-position:center;cursor:pointer;padding:0;}
+.kb-lightbox{position:fixed;inset:0;background:rgba(0,0,0,.82);display:flex;align-items:center;justify-content:center;z-index:60;padding:20px;cursor:zoom-out;}
+.kb-lightbox img{max-width:100%;max-height:100%;border-radius:10px;}
+.kb-photoadd{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:6px;}
+.kb-photo-btn{border:1px dashed var(--line);border-radius:9px;padding:9px 12px;background:var(--paper);cursor:pointer;font-family:inherit;font-size:13.5px;color:var(--ink);display:flex;align-items:center;gap:7px;}
+.kb-photo-btn:hover{border-color:var(--ink);}
+.kb-form-thumb{position:relative;width:54px;height:54px;border-radius:8px;border:1px solid var(--line);background-size:cover;background-position:center;}
+.kb-form-thumb button{position:absolute;top:-7px;right:-7px;width:20px;height:20px;border-radius:50%;border:none;background:var(--ink);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;}
+.kb-photo-note{font-size:11.5px;color:var(--muted);margin:0 0 8px;line-height:1.45;}
+
 /* ---- WIDE: Jira-style side-by-side columns when there's room ---- */
 @media (min-width:900px){
   .kb-shell{max-width:1180px;}
@@ -208,6 +243,16 @@ function CardForm({ initial, defaultCol, onSave, onCancel }) {
   const [desc, setDesc] = useState(initial ? initial.desc : "");
   const [epic, setEpic] = useState(initial ? initial.epic : "checks");
   const [priority, setPriority] = useState(initial ? initial.priority : "Med");
+  const [photos, setPhotos] = useState(initial && initial.photos ? initial.photos : []);
+
+  const handleFiles = async (e) => {
+    const files = Array.from(e.target.files || []);
+    for (const f of files) {
+      try { const data = await compressImage(f); setPhotos((p) => [...p, data]); } catch (err) {}
+    }
+    e.target.value = "";
+  };
+
   return (
     <div className="kb-form">
       <input className="kb-input" placeholder="Ticket title" value={title} onChange={(e) => setTitle(e.target.value)} autoFocus />
@@ -220,9 +265,21 @@ function CardForm({ initial, defaultCol, onSave, onCancel }) {
           <option value="High">High</option><option value="Med">Med</option><option value="Low">Low</option>
         </select>
       </div>
+      <div className="kb-photoadd">
+        {photos.map((src, i) => (
+          <div key={i} className="kb-form-thumb" style={{ backgroundImage: `url(${src})` }}>
+            <button onClick={() => setPhotos(photos.filter((_, j) => j !== i))} title="Remove photo"><X size={12} /></button>
+          </div>
+        ))}
+        <label className="kb-photo-btn">
+          <Plus size={15} /> Add photo
+          <input type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleFiles} />
+        </label>
+      </div>
+      <p className="kb-photo-note">Photos are saved on this device only, and the board has limited room — keep it to a few per ticket.</p>
       <div className="kb-form-actions">
         <button className="kb-btn kb-btn-ghost" onClick={onCancel}><X size={16} /> Cancel</button>
-        <button className="kb-btn kb-btn-primary" onClick={() => { if (!title.trim()) return; onSave({ title: title.trim(), desc: desc.trim(), epic, priority, col: initial ? initial.col : defaultCol }); }}>
+        <button className="kb-btn kb-btn-primary" onClick={() => { if (!title.trim()) return; onSave({ title: title.trim(), desc: desc.trim(), epic, priority, photos, col: initial ? initial.col : defaultCol }); }}>
           <Check size={16} /> Save
         </button>
       </div>
@@ -244,6 +301,7 @@ function Kanban() {
   const [expanded, setExpanded] = useState({});
   const [dragId, setDragId] = useState(null);
   const [overCol, setOverCol] = useState(null);
+  const [viewer, setViewer] = useState(null);
 
   useEffect(() => {
     try {
@@ -258,8 +316,12 @@ function Kanban() {
   }, []);
 
   const persist = (next) => {
-    setCards(next);
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch (e) {}
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      setCards(next);
+    } catch (e) {
+      window.alert("The board is full, so that couldn't be saved. Photos take up a lot of room — try removing a few, or this is the point to move to the shared online version.");
+    }
   };
   const move = (id, dir) => {
     let landed = null;
@@ -359,6 +421,13 @@ function Kanban() {
                         </div>
                         <p className="kb-title" onClick={() => setExpanded({ ...expanded, [c.id]: !isOpen })}>{c.title}</p>
                         {c.desc && isOpen && <p className="kb-desc">{c.desc}</p>}
+                        {c.photos && c.photos.length > 0 && (
+                          <div className="kb-photos">
+                            {c.photos.map((src, i) => (
+                              <button key={i} className="kb-thumb" style={{ backgroundImage: `url(${src})` }} onClick={() => setViewer(src)} title="View photo" />
+                            ))}
+                          </div>
+                        )}
                         <div className="kb-card-actions">
                           <button className="kb-iconbtn" disabled={idx === 0} onClick={() => move(c.id, -1)} title="Move back"><ChevronLeft size={16} /></button>
                           <button className="kb-iconbtn" disabled={idx === COLUMNS.length - 1} onClick={() => move(c.id, 1)} title="Move forward"><ChevronRight size={16} /></button>
@@ -381,6 +450,11 @@ function Kanban() {
           <button className="kb-reset" onClick={resetBoard}><RotateCcw size={13} /> Reset to starter backlog</button>
         </div>
       </div>
+      {viewer && (
+        <div className="kb-lightbox" onClick={() => setViewer(null)}>
+          <img src={viewer} alt="Ticket photo" />
+        </div>
+      )}
     </div>
   );
 }
